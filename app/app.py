@@ -4,7 +4,12 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import lightgbm as lgb
 from pathlib import Path
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, TargetEncoder
 
 # 1. Configuración general de página
 st.set_page_config(
@@ -16,13 +21,7 @@ st.set_page_config(
 # Evitar que el traductor automático de Chrome congele los títulos dinámicos en el DOM
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
-# 2. Carga en caché del modelo entrenado y los datos históricos de referencia
-@st.cache_resource
-def load_model():
-    base_dir = Path(__file__).resolve().parent.parent
-    model_path = base_dir / "models" / "lgbm_rendimiento.joblib"
-    return joblib.load(model_path)
-
+# 2. Carga en caché de los datos históricos de referencia
 @st.cache_data
 def load_reference_data() -> pd.DataFrame:
     base_dir = Path(__file__).resolve().parent.parent
@@ -31,14 +30,71 @@ def load_reference_data() -> pd.DataFrame:
     df = df[df['superficie_cosechada_ha'] > 0].copy()
     return df
 
+# 3. Carga o auto-entrenamiento en caché del modelo LightGBM
+@st.cache_resource
+def load_or_train_model(df_raw: pd.DataFrame):
+    base_dir = Path(__file__).resolve().parent.parent
+    model_path = base_dir / "models" / "lgbm_rendimiento.joblib"
+
+    if model_path.exists():
+        return joblib.load(model_path)
+
+    # Si no existe el binario (ej. ignorado por .gitignore en despliegue cloud),
+    # entrenamos el pipeline ganador directamente en memoria (~7 segundos)
+    df = df_raw.copy()
+    df['ALLSKY_SFC_SW_DWN'] = df['ALLSKY_SFC_SW_DWN'].replace(0, np.nan)
+    df['log_sup_sembrada'] = np.log1p(df['superficie_sembrada_ha'])
+    df['log_sup_cosechada'] = np.log1p(df['superficie_cosechada_ha'])
+    df['ratio_cosechada'] = (
+        df['superficie_cosechada_ha'] / df['superficie_sembrada_ha'].replace(0, np.nan)
+    ).clip(upper=1.5)
+    df['amplitud_termica'] = df['T2M_MAX'] - df['T2M_MIN']
+
+    cat_ohe = ['cultivo', 'provincia']
+    cat_te = ['departamento']
+    num_cols = [
+        'año', 'log_sup_sembrada', 'log_sup_cosechada', 'ratio_cosechada',
+        'T2M', 'T2M_MAX', 'T2M_MIN', 'amplitud_termica',
+        'ALLSKY_SFC_SW_DWN', 'RH2M', 'precip_total_mm'
+    ]
+    target = 'rendimiento_kgxha'
+
+    df = df.dropna(subset=[target])
+    X = df[cat_ohe + cat_te + num_cols]
+    y = df[target]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=False), cat_ohe),
+            ('te', TargetEncoder(random_state=42), cat_te),
+            ('num', SimpleImputer(strategy='median'), num_cols)
+        ]
+    )
+
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('regressor', lgb.LGBMRegressor(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=63,
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1
+        ))
+    ])
+
+    pipeline.fit(X, y)
+    return pipeline
+
 try:
-    model = load_model()
     df_hist = load_reference_data()
-except FileNotFoundError as e:
-    st.error(f"Falta un archivo requerido: {e}. Asegúrate de ejecutar primero 'python models/exportar_modelo.py'.")
+    with st.spinner("Inicializando modelo predictivo LightGBM..."):
+        model = load_or_train_model(df_hist)
+except Exception as e:
+    st.error(f"Error al inicializar el modelo o los datos: {e}")
     st.stop()
 
-# 3. Encabezado del Simulador
+# 4. Encabezado del Simulador
 st.title("🌾 Simulador Predictivo de Rendimiento Agrícola (LightGBM)")
 st.markdown(
     "Estimación de rendimiento (**kg/ha**) y producción total en base a ubicación geográfica, "
@@ -46,10 +102,9 @@ st.markdown(
 )
 st.divider()
 
-# 4. Panel Lateral: Controles de Simulación
+# 5. Panel Lateral: Controles de Simulación
 st.sidebar.header("Parámetros de Simulación")
 
-# Selección geográfica en cascada (Provincia -> Departamento)
 provincias = sorted(df_hist['provincia'].dropna().unique().tolist())
 default_prov_idx = provincias.index("SANTA FE") if "SANTA FE" in provincias else 0
 provincia_sel = st.sidebar.selectbox("Provincia:", provincias, index=default_prov_idx)
@@ -57,7 +112,6 @@ provincia_sel = st.sidebar.selectbox("Provincia:", provincias, index=default_pro
 deptos_prov = sorted(df_hist[df_hist['provincia'] == provincia_sel]['departamento'].dropna().unique().tolist())
 depto_sel = st.sidebar.selectbox("Departamento:", deptos_prov)
 
-# Selección de Cultivo (priorizando los disponibles en la provincia/departamento)
 cultivos_prov = sorted(df_hist[df_hist['provincia'] == provincia_sel]['cultivo'].dropna().unique().tolist())
 if not cultivos_prov:
     cultivos_prov = sorted(df_hist['cultivo'].dropna().unique().tolist())
@@ -86,7 +140,6 @@ sup_cosechada = st.sidebar.number_input(
     step=50.0
 )
 
-# Obtener promedios climáticos históricos de la zona seleccionada
 subset_zona = df_hist[(df_hist['provincia'] == provincia_sel) & (df_hist['departamento'] == depto_sel)]
 if subset_zona.empty:
     subset_zona = df_hist[df_hist['provincia'] == provincia_sel]
@@ -95,7 +148,6 @@ rad_default = subset_zona['ALLSKY_SFC_SW_DWN'].replace(0, np.nan).mean()
 if pd.isna(rad_default):
     rad_default = df_hist['ALLSKY_SFC_SW_DWN'].replace(0, np.nan).mean()
 
-# Clave única por zona para que los sliders se actualicen al cambiar de provincia/departamento
 zona_key = f"{provincia_sel}_{depto_sel}"
 
 st.sidebar.subheader("Escenario Climático")
@@ -124,7 +176,7 @@ radiacion = st.sidebar.slider(
     float(round(rad_default, 1)), 0.5, key=f"rad_{zona_key}"
 )
 
-# 5. Construcción del registro de entrada con las mismas transformaciones del entrenamiento
+# 6. Construcción del registro de entrada e inferencia
 t_max_adj = max(t2m_max, t2m)
 t_min_adj = min(t2m_min, t2m)
 
@@ -145,11 +197,9 @@ input_data = pd.DataFrame([{
     'precip_total_mm': precip
 }])
 
-# Ejecutar predicción en vivo
 pred_rendimiento = max(float(model.predict(input_data)[0]), 0.0)
 produccion_estimada_tn = (pred_rendimiento * sup_cosechada) / 1000.0
 
-# Calcular benchmark histórico específico (priorizando departamento, si no provincia)
 hist_depto = df_hist[
     (df_hist['provincia'] == provincia_sel) &
     (df_hist['departamento'] == depto_sel) &
@@ -172,7 +222,6 @@ else:
 
 delta_pct = ((pred_rendimiento - media_hist) / media_hist * 100) if media_hist > 0 else 0.0
 
-# Banner resumen dinámico del escenario activo (blindado contra traducción de navegador)
 st.markdown(
     f'<div translate="no" style="padding: 0.75rem 1rem; border-radius: 0.5rem; background-color: #EFF6FF; color: #1E3A8A; border-left: 4px solid #2563EB; margin-bottom: 1rem;">'
     f'<b>Escenario Activo:</b> {cultivo_sel} &nbsp;|&nbsp; <b>Ubicación:</b> {depto_sel}, {provincia_sel} &nbsp;|&nbsp; <b>Campaña:</b> {anio_sel}'
@@ -180,7 +229,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# 6. Resultados Principales (KPIs)
+# 7. Resultados Principales (KPIs)
 k1, k2, k3, k4 = st.columns(4)
 k1.metric(
     label="Rendimiento Estimado",
@@ -202,7 +251,7 @@ k4.metric(
 
 st.divider()
 
-# 7. Contexto Histórico Visual (Evolución y Comparación Regional)
+# 8. Contexto Histórico Visual
 g1, g2 = st.columns(2)
 
 with g1:
@@ -211,7 +260,6 @@ with g1:
         evol_prov = hist_prov.groupby('año', as_index=False)['rendimiento_kgxha'].mean()
         fig_evol = go.Figure()
 
-        # Curva promedio provincial
         fig_evol.add_trace(go.Scatter(
             x=evol_prov['año'],
             y=evol_prov['rendimiento_kgxha'],
@@ -220,7 +268,6 @@ with g1:
             line=dict(color='#16A34A', width=2.5)
         ))
 
-        # Curva específica del departamento si tiene datos
         if not hist_depto.empty:
             evol_depto = hist_depto.groupby('año', as_index=False)['rendimiento_kgxha'].mean()
             fig_evol.add_trace(go.Scatter(
@@ -231,7 +278,6 @@ with g1:
                 line=dict(color='#0284C7', width=2, dash='dot')
             ))
 
-        # Línea horizontal de predicción actual
         fig_evol.add_hline(
             y=pred_rendimiento,
             line_dash="dash",
