@@ -4,6 +4,8 @@ Proyecto integral de Ciencia de Datos y Machine Learning orientado a analizar, m
 
 Además del análisis exploratorio, la segmentación no supervisada de zonas agroclimáticas y la evaluación comparativa de algoritmos supervisados y redes neuronales, el repositorio incorpora un **Simulador Predictivo Interactivo en Streamlit** impulsado por un pipeline serializado de **LightGBM**.
 
+**https://simulador-agro-clima-arg.streamlit.app**
+
 ## 🎯 Problema de Negocio
 
 Predecir el rendimiento esperado por hectárea (kg/ha) a nivel de **cultivo, provincia y departamento** permite:
