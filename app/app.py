@@ -88,8 +88,7 @@ def load_or_train_model(df_raw: pd.DataFrame):
 
 try:
     df_hist = load_reference_data()
-    with st.spinner("Inicializando modelo predictivo LightGBM..."):
-        model = load_or_train_model(df_hist)
+    model = load_or_train_model(df_hist)
 except Exception as e:
     st.error(f"Error al inicializar el modelo o los datos: {e}")
     st.stop()
